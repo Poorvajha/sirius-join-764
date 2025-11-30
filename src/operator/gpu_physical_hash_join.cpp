@@ -30,7 +30,7 @@ template <typename T>
 void 
 ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type,
-		bool unique_build_keys, GPUBufferManager* gpuBufferManager) {
+		bool unique_build_keys, GPUBufferManager* gpuBufferManager, uint8_t* matched_flags = nullptr)) {
 	int num_keys = conditions.size();
 	uint8_t** probe_data = gpuBufferManager->customCudaHostAlloc<uint8_t*>(num_keys);
 
@@ -68,6 +68,13 @@ ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* 
 		} else {
 			probeHashTable<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, true);
 		}
+	} else if (join_type == JoinType::LEFT) {
+		// LEFT join: track matched LHS rows, probe with is_right=false
+		if (unique_build_keys) {
+			probeHashTableSingleMatch<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 0, matched_flags);
+		} else {
+			probeHashTable<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, false, matched_flags);
+		}
 	} else if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		if (unique_build_keys) {
 			probeHashTableRightSemiAntiSingleMatch<T>(probe_data, ht, ht_len, size, condition_mode, num_keys);
@@ -82,14 +89,14 @@ ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* 
 void
 HandleProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* &count, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
 		unsigned long long* ht, uint64_t ht_len, const vector<JoinCondition> &conditions, JoinType join_type, 
-		bool unique_build_keys, GPUBufferManager* gpuBufferManager) {
+		bool unique_build_keys, GPUBufferManager* gpuBufferManager, uint8_t* matched_flags = nullptr) {
     switch(probe_keys[0]->data_wrapper.type.id()) {
       case GPUColumnTypeId::INT32:
-				ResolveTypeProbeExpression<int32_t>(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
+				ResolveTypeProbeExpression<int32_t>(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager, matched_flags);
 				break;
       case GPUColumnTypeId::INT64:
       case GPUColumnTypeId::FLOAT64:
-				ResolveTypeProbeExpression<int64_t>(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
+				ResolveTypeProbeExpression<int64_t>(probe_keys, count, row_ids_left, row_ids_right, ht, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager, matched_flags);
 				break;
       default:
         throw NotImplementedException("Unsupported sirius column type in `HandleProbeExpression`: %d",
@@ -340,6 +347,54 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 			SIRIUS_LOG_DEBUG("Right join so columns from LHS will be null");
 			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr);
 		}
+	} } else if (join_type == JoinType::LEFT) {
+		// LEFT join: output unmatched LHS rows with NULL RHS columns
+		GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
+		uint64_t* row_ids = nullptr;
+		uint64_t* count = nullptr;
+		
+		// Find unmatched LHS rows
+		scanUnmatchedLHSRows(matched_lhs_rows, lhs_probe_size, row_ids, count);
+		
+		if (count[0] == 0) {
+			SIRIUS_LOG_DEBUG("No unmatched LHS rows");
+			// Clean up
+			if (matched_lhs_rows != nullptr) {
+				gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(matched_lhs_rows), 0);
+				matched_lhs_rows = nullptr;
+			}
+			return SourceResultType::FINISHED;
+		}
+		
+		SIRIUS_LOG_DEBUG("Found {} unmatched LHS rows", count[0]);
+		
+		// Materialize unmatched LHS rows
+		HandleMaterializeRowIDsLHS(*stored_lhs_input, output_relation, lhs_output_columns.col_idxs, count[0], row_ids, gpuBufferManager, false);
+		
+		// Add NULL RHS columns
+		for (idx_t i = 0; i < rhs_output_columns.col_idxs.size(); i++) {
+			idx_t output_col_idx = lhs_output_columns.col_idxs.size() + i;
+			const auto rhs_col = rhs_output_columns.col_idxs[i];
+			auto &rhs_col_type = rhs_output_columns.col_types[i];
+			SIRIUS_LOG_DEBUG("Writing NULL RHS column {} to output column {}", rhs_col, output_col_idx);
+			// Convert LogicalType to GPUColumnType
+			GPUColumnType gpu_col_type = convertLogicalTypeToColumnType(rhs_col_type);
+			// Create validity mask with all NULLs
+			auto validity_mask = createNullMask(count[0], cudf::mask_state::ALL_NULL);
+			output_relation.columns[output_col_idx] = make_shared_ptr<GPUColumn>(count[0], gpu_col_type, nullptr, validity_mask);
+		}
+		
+		// Clean up
+		if (matched_lhs_rows != nullptr) {
+			gpuBufferManager->customCudaFree(reinterpret_cast<uint8_t*>(matched_lhs_rows), 0);
+			matched_lhs_rows = nullptr;
+		}
+		
+		auto end = std::chrono::high_resolution_clock::now();
+		auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+		SIRIUS_LOG_DEBUG("Hash Join GetData (LEFT) time: {:.2f} ms", duration.count()/1000.0);
+		
+		return SourceResultType::FINISHED;
 	} else {
 		throw InvalidInputException("Get data not supported for this join type");
 	}
@@ -467,6 +522,23 @@ GPUPhysicalHashJoin::Execute(GPUIntermediateRelation &input_relation, GPUInterme
 		}
 	} else if (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::OUTER || join_type == JoinType::RIGHT || join_type == JoinType::LEFT) {
 		HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager);
+		// For LEFT join, store LHS input and allocate matched flags
+		if (join_type == JoinType::LEFT) {
+			// Store LHS input relation for later use in GetData
+			stored_lhs_input = make_shared_ptr<GPUIntermediateRelation>(input_relation.column_count);
+			for (idx_t i = 0; i < input_relation.column_count; i++) {
+				stored_lhs_input->columns[i] = make_shared_ptr<GPUColumn>(input_relation.columns[i]);
+				stored_lhs_input->column_names[i] = input_relation.column_names[i];
+			}
+			stored_lhs_input->names = input_relation.names;
+			
+			// Allocate and initialize matched flags
+			lhs_probe_size = probe_key[0]->column_length;
+			matched_lhs_rows = gpuBufferManager->customCudaMalloc<uint8_t>(lhs_probe_size, 0, 0);
+			cudaMemset(matched_lhs_rows, 0, lhs_probe_size * sizeof(uint8_t));
+		}
+		HandleProbeExpression(probe_key, count, row_ids_left, row_ids_right, gpu_hash_table, ht_len, conditions, join_type, unique_build_keys, gpuBufferManager, 
+			join_type == JoinType::LEFT ? matched_lhs_rows : nullptr);
 		// if (count[0] == 0) throw NotImplementedException("No match found");
 	} else if (join_type == JoinType::MARK) {
 		SIRIUS_LOG_DEBUG("Writing boolean column to output relation");
@@ -612,7 +684,11 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		if (ht_len == 0) gpu_hash_table = nullptr;
 		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
-	}
+	} else if (join_type == JoinType::LEFT || join_type == JoinType::OUTER) {
+		// LEFT join uses standard hash table (no extra column needed for tracking in hash table)
+		if (ht_len == 0) gpu_hash_table = nullptr;
+		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 1), 0, 0);
+	} 
 	
 	if (join_type == JoinType::INNER) {
 		// check if there is a non-equality condition
