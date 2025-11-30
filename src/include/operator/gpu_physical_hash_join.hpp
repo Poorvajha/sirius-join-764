@@ -37,14 +37,14 @@ void cudf_mixed_or_conditional_inner_join(vector<shared_ptr<GPUColumn>>& probe_c
 
 template <typename T>
 void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, 
-			uint64_t N, int* condition_mode, int num_keys, bool is_right);
+					uint64_t N, int* condition_mode, int num_keys, bool is_right, uint8_t* matched_flags = nullptr);
 
 template <typename T>
 void probeHashTableRightSemiAnti(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
 
 template <typename T>
 void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
-            uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode);
+            uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode, uint8_t* matched_flags = nullptr);
 
 template <typename T>
 void probeHashTableRightSemiAntiSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys);
@@ -56,6 +56,8 @@ template <typename T>
 void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t N, int* condition_mode, int num_keys, bool is_right);
 
 void scanHashTableRight(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids, uint64_t* &count, int join_mode, int num_keys);
+
+void scanUnmatchedLHSRows(uint8_t* matched_flags, uint64_t N, uint64_t* &row_ids, uint64_t* &count);
 
 class GPUPhysicalHashJoin : public GPUPhysicalOperator {
 public:
@@ -115,7 +117,7 @@ protected:
 
 	//! Becomes a source when it is an external join
 	bool IsSource() const override {
-		return true;
+		return join_type == JoinType::RIGHT || join_type == JoinType::LEFT || join_type == JoinType::OUTER;
 	}
 
 	bool ParallelSource() const override {
@@ -141,5 +143,8 @@ public:
 	shared_ptr<GPUIntermediateRelation> hash_table_result;
 
 	shared_ptr<GPUIntermediateRelation> materialized_build_key;
+    mutable shared_ptr<GPUIntermediateRelation> stored_lhs_input;
+	mutable uint8_t* matched_lhs_rows = nullptr;
+	mutable uint64_t lhs_probe_size = 0;
 };
 } // namespace duckdb
