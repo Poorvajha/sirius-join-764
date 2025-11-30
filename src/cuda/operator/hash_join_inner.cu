@@ -104,7 +104,7 @@ __global__ void probe_multikey_count(T **keys, unsigned long long* ht, uint64_t 
 
 template <int B, int I, typename T>
 __global__ void probe_multikey(T **keys, unsigned long long* ht, uint64_t ht_len, uint64_t *offset_each_thread, 
-        uint64_t *row_ids_left, uint64_t *row_ids_right, uint64_t N, int* condition_mode, int num_keys, int equal_keys, bool is_right) {
+        uint64_t *row_ids_left, uint64_t *row_ids_right, uint64_t N, int* condition_mode, int num_keys, int equal_keys, bool is_right,  uint8_t* matched_flags) {
 
     uint64_t tile_size = B * I;
     uint64_t tile_offset = blockIdx.x * tile_size;
@@ -149,6 +149,9 @@ __global__ void probe_multikey(T **keys, unsigned long long* ht, uint64_t ht_len
                     row_ids_right[output_offset] = ht[slot * n_ht_column + num_keys];
                     row_ids_left[output_offset] = tile_offset + threadIdx.x + ITEM * B;
                     if (is_right) ht[slot * n_ht_column + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
+                    if (matched_flags != nullptr) {
+                        matched_flags[tile_offset + threadIdx.x + ITEM * B] = 1;
+                    }
                     output_offset++;
                 }
                 slot = (slot + 65599) % ht_len;
@@ -238,7 +241,7 @@ void buildHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
 }
 
 template <typename T>
-void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, bool is_right) {
+void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, bool is_right, uint8_t* matched_flags = nullptr) {
     CHECK_ERROR();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (N == 0 || ht_len == 0) {
@@ -291,7 +294,7 @@ void probeHashTable(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uin
     row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(h_count[0], 0, 0);
     probe_multikey<BLOCK_THREADS, ITEMS_PER_THREAD, T><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, 
-            offset_each_thread, row_ids_left, row_ids_right, N, condition_mode_dev, num_keys, equal_keys, is_right);
+            offset_each_thread, row_ids_left, row_ids_right, N, condition_mode_dev, num_keys, equal_keys, is_right, matched_flags);
     CHECK_ERROR();
     cudaDeviceSynchronize();
     // uint64_t* h_count = gpuBufferManager->customCudaHostAlloc<uint64_t>(1);
