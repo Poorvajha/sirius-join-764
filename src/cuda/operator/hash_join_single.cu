@@ -64,7 +64,7 @@ __global__ void probe_right_semi_anti_single(T **keys, unsigned long long* ht, u
 
 template <int B, int I, typename T>
 __global__ void probe_single_match(T **keys, unsigned long long* ht, uint64_t ht_len, uint64_t *row_ids_left, uint64_t *row_ids_right, unsigned long long* count, 
-            uint64_t N, int* condition_mode, int num_keys, int equal_keys, int join_mode, bool is_count) {
+            uint64_t N, int* condition_mode, int num_keys, int equal_keys, int join_mode, bool is_count, uint8_t* matched_flags) {
 
     typedef cub::BlockScan<int, B> BlockScanInt;
 
@@ -134,6 +134,9 @@ __global__ void probe_single_match(T **keys, unsigned long long* ht, uint64_t ht
             } else {
                 if (found) {
                     if (join_mode == 3) ht[slot * (num_keys + 2) + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
+                    if (matched_flags != nullptr) {
+                        matched_flags[tile_offset + threadIdx.x + ITEM * B] = 1;
+                    }
                     t_count++;
                     selection_flags[ITEM] = 1;
                 }
@@ -220,7 +223,7 @@ __global__ void probe_mark(T **keys, unsigned long long* ht, uint64_t ht_len, ui
 
 template <typename T>
 void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t ht_len, uint64_t* &row_ids_left, uint64_t* &row_ids_right, 
-            uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode) {
+            uint64_t* &count, uint64_t N, int* condition_mode, int num_keys, int join_mode, uint8_t* matched_flags = nullptr) {
     CHECK_ERROR();
     GPUBufferManager* gpuBufferManager = &(GPUBufferManager::GetInstance());
     if (N == 0 || ht_len == 0) {
@@ -263,7 +266,7 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     if (join_mode == 0 || join_mode == 3) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
     probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD, T><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, 
-            N, condition_mode_dev, num_keys, equal_keys, join_mode, 0);
+            N, condition_mode_dev, num_keys, equal_keys, join_mode, 0, matched_flags);
     CHECK_ERROR();
     cudaDeviceSynchronize();
 
