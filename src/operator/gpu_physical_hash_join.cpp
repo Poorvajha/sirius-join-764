@@ -74,6 +74,18 @@ ResolveTypeProbeExpression(vector<shared_ptr<GPUColumn>> &probe_keys, uint64_t* 
 		} else {
 			probeHashTableRightSemiAnti<T>(probe_data, ht, ht_len, size, condition_mode, num_keys);
 		}
+	} else if (join_type == JoinType::LEFT) {
+		if (unique_build_keys) {
+			probeHashTableSingleMatch<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, 4);
+		} else {
+			probeHashTable<T>(probe_data, ht, ht_len, row_ids_left, row_ids_right, count, size, condition_mode, num_keys, false);
+		}
+	} else if (join_type == JoinType::LEFT_SEMI || join_type == JoinType::LEFT_ANTI) {
+		if (unique_build_keys) {
+			probeHashTableLeftSemiAnti<T>(probe_data, ht, ht_len, size, condition_mode, num_keys);
+		} else {
+			probeHashTableLeftSemiAnti<T>(probe_data, ht, ht_len, size, condition_mode, num_keys);
+		}
 	} else {
 		throw NotImplementedException("Unsupported join type");
 	}
@@ -172,6 +184,8 @@ ResolveTypeBuildExpression(vector<shared_ptr<GPUColumn>> &build_keys, unsigned l
 		buildHashTable<T>(build_data, ht, ht_len, size, condition_mode, num_keys, 0);
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		buildHashTable<T>(build_data, ht, ht_len, size, condition_mode, num_keys, 1);
+	} else if (join_type == JoinType::LEFT || join_type == JoinType::LEFT_SEMI || join_type == JoinType::LEFT_ANTI) {
+		buildHashTable<T>(build_data, ht, ht_len, size, condition_mode, num_keys, 0);
 	} else {
 		throw NotImplementedException("Unsupported join type");
 	}
@@ -201,6 +215,10 @@ HandleScanHTExpression(unsigned long long* ht, uint64_t ht_len, uint64_t* &row_i
 		scanHashTableRight(ht, ht_len, row_ids, count, 0, num_keys);
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_ANTI) {
 		scanHashTableRight(ht, ht_len, row_ids, count, 1, num_keys);
+	} else if (join_type == JoinType::LEFT_SEMI || join_type == JoinType::LEFT) {
+		scanProbeDataLeft(NULL, 0, row_ids, count);
+	} else if (join_type == JoinType::LEFT_ANTI) {
+		scanProbeDataLeft(NULL, 0, row_ids, count);
 	} else {
 		throw NotImplementedException("Unsupported join type");
 	}
@@ -334,6 +352,15 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 	if (join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
 		SIRIUS_LOG_DEBUG("Right semi or right anti join so there will be no columns from LHS");
 		left_column_count = 0;
+	} else if (join_type == JoinType::LEFT_SEMI || join_type == JoinType::LEFT_ANTI) {
+		SIRIUS_LOG_DEBUG("Left semi or left anti join so there will be no columns from RHS");
+		left_column_count = output_relation.columns.size();
+	} else if (join_type == JoinType::LEFT) {
+		SIRIUS_LOG_DEBUG("Left join so columns from RHS will be null");
+		for (idx_t col = left_column_count; col < output_relation.columns.size(); col++) {
+			//pretend this to be NUll column from the right table (it should be NULL for the LEFT join)
+			output_relation.columns[col] = make_shared_ptr<GPUColumn>(0, GPUColumnType(GPUColumnTypeId::INT64), nullptr, nullptr);
+		}
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::OUTER) {
 		for (idx_t col = 0; col < left_column_count; col++) {
 			//pretend this to be NUll column from the left table (it should be NULL for the RIGHT join)
@@ -357,11 +384,15 @@ GPUPhysicalHashJoin::GetData(GPUIntermediateRelation &output_relation) const {
 		const auto rhs_col = rhs_output_columns.col_idxs[i];
 		SIRIUS_LOG_DEBUG("Writing hash_table column {} to column {}", rhs_col, i);
 	}
-	//TODO: Check if we need to maintain unique for the RHS columns
-	if (unique_probe_keys) {
-		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, left_column_count, count[0], row_ids, gpuBufferManager, true);
-	} else {
-		HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, left_column_count, count[0], row_ids, gpuBufferManager, false);
+	
+	// For LEFT, LEFT_SEMI, LEFT_ANTI joins, we don't materialize RHS columns
+	if (join_type != JoinType::LEFT_SEMI && join_type != JoinType::LEFT_ANTI && join_type != JoinType::LEFT) {
+		//TODO: Check if we need to maintain unique for the RHS columns
+		if (unique_probe_keys) {
+			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, left_column_count, count[0], row_ids, gpuBufferManager, true);
+		} else {
+			HandleMaterializeRowIDsRHS(*hash_table_result, output_relation, rhs_output_columns.col_idxs, left_column_count, count[0], row_ids, gpuBufferManager, false);
+		}
 	}
 	// for (idx_t i = 0; i < hash_table_result->columns.size(); i++) {
 	// 	if (find(rhs_output_columns.col_idxs.begin(), rhs_output_columns.col_idxs.end(), i) == rhs_output_columns.col_idxs.end()) {
@@ -610,6 +641,9 @@ GPUPhysicalHashJoin::Sink(GPUIntermediateRelation &input_relation) const {
 		if (ht_len == 0) gpu_hash_table = nullptr;
 		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 1), 0, 0);
 	} else if (join_type == JoinType::RIGHT || join_type == JoinType::RIGHT_SEMI || join_type == JoinType::RIGHT_ANTI) {
+		if (ht_len == 0) gpu_hash_table = nullptr;
+		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
+	} else if (join_type == JoinType::LEFT || join_type == JoinType::LEFT_SEMI || join_type == JoinType::LEFT_ANTI) {
 		if (ht_len == 0) gpu_hash_table = nullptr;
 		else gpu_hash_table = (unsigned long long*) gpuBufferManager->customCudaMalloc<uint64_t>(ht_len * (conditions.size() + 2), 0, 0);
 	}

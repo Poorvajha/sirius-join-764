@@ -19,6 +19,7 @@ set(CUDA_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/materialize.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_inner.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_right.cu
+        ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_left.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/hash_join_single.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/nested_loop_join.cu
         ${CMAKE_CURRENT_SOURCE_DIR}/strings_matching.cu

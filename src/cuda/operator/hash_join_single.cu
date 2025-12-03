@@ -97,7 +97,7 @@ __global__ void probe_single_match(T **keys, unsigned long long* ht, uint64_t ht
 
     // int n_ht_column = num_keys + 1;
     int n_ht_column;
-    if (join_mode == 3) n_ht_column = num_keys + 2;
+    if (join_mode == 3 || join_mode == 4) n_ht_column = num_keys + 2;
     else n_ht_column = num_keys + 1;
 
     #pragma unroll
@@ -133,7 +133,7 @@ __global__ void probe_single_match(T **keys, unsigned long long* ht, uint64_t ht
                 }
             } else {
                 if (found) {
-                    if (join_mode == 3) ht[slot * (num_keys + 2) + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
+                    if (join_mode == 3 || join_mode == 4) ht[slot * (num_keys + 2) + num_keys + 1] = tile_offset + threadIdx.x + ITEM * B;
                     t_count++;
                     selection_flags[ITEM] = 1;
                 }
@@ -158,7 +158,7 @@ __global__ void probe_single_match(T **keys, unsigned long long* ht, uint64_t ht
         if (threadIdx.x + ITEM * B < num_tile_items) {
             if(selection_flags[ITEM]) {
                 uint64_t offset = block_off + c_t_count++;
-                if (join_mode == 0 || join_mode == 3) { // inner join and right join
+                if (join_mode == 0 || join_mode == 3 || join_mode == 4) { // inner join and right join and left join
                     row_ids_right[offset] = items_off[ITEM];
                     row_ids_left[offset] = tile_offset + threadIdx.x + ITEM * B;
                 } else if (join_mode == 1 || join_mode == 2) { // semi join and anti join
@@ -260,7 +260,7 @@ void probeHashTableSingleMatch(uint8_t **keys, unsigned long long* ht, uint64_t 
     // row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_half, 0, 0);
     row_ids_left = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
     // if (join_mode == 0 || join_mode == 3) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(openmalloc_half, 0, 0);
-    if (join_mode == 0 || join_mode == 3) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
+    if (join_mode == 0 || join_mode == 3 || join_mode == 4) row_ids_right = gpuBufferManager->customCudaMalloc<uint64_t>(N, 0, 0);
     cudaMemset(count, 0, sizeof(uint64_t));
     probe_single_match<BLOCK_THREADS, ITEMS_PER_THREAD, T><<<(N + tile_items - 1)/tile_items, BLOCK_THREADS>>>(keys_dev, ht, ht_len, row_ids_left, row_ids_right, (unsigned long long*) count, 
             N, condition_mode_dev, num_keys, equal_keys, join_mode, 0);
